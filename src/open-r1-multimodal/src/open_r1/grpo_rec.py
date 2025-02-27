@@ -44,6 +44,25 @@ import math
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLVisionFlashAttention2, apply_rotary_pos_emb_flashatt, flash_attn_varlen_func
 import torch
 from typing import Tuple
+from sentence_transformers import SentenceTransformer, util
+import time
+
+
+sentence_model = SentenceTransformer("uer/sbert-base-chinese-nli")
+
+
+def sentence_similar(text1, text2):
+    embedding1 = sentence_model.encode(text1)
+    embedding2 = sentence_model.encode(text2)
+    similarity = util.cos_sim(embedding1, embedding2).item()
+    return abs(similarity)
+
+
+t1 = time.time()
+print(sentence_similar("123", "123"))
+print(time.time()-t1)
+
+
 def custom_forward(
         self,
         hidden_states: torch.Tensor,
@@ -99,11 +118,11 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "List of reward functions. Possible values: 'accuracy', 'format'"},
     )
     max_pixels: Optional[int] = field(
-        default=12845056,
+        default=1280*28*28,
         metadata={"help": "Maximum number of pixels for the image"},
     )
     min_pixels: Optional[int] = field(
-        default=3136,
+        default=256*28*28,
         metadata={"help": "Minimum number of pixels for the image"},
     )
     image_root: Optional[str] = field(
@@ -117,6 +136,10 @@ SYSTEM_PROMPT = (
     "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
     "<think> reasoning process here </think><answer> answer here </answer>"
 )
+
+QUESTION_TEMPLATE = "{Question}，先在<think> </think>标签中输出思考过程，然后在<answer> </answer>标签中输出最终答案"
+""
+
 
 class LazySupervisedDataset(Dataset):
     def __init__(self, data_path: str, script_args: GRPOScriptArguments):
@@ -178,16 +201,8 @@ class LazySupervisedDataset(Dataset):
 
     def __getitem__(self, i):
         # Format into conversation
-        def make_conversation(example):
-            return {
-                "prompt": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": example["problem"]},
-                ],
-            }
         # FIXME
         # This is only for Grounding task
-        QUESTION_TEMPLATE = "{Question} First output the thinking process in <think> </think> tags and then output the final answer in <answer> </answer> tags. Output the final answer in JSON format."
         def make_conversation_image(example):
             return {
                 "prompt": [
@@ -221,50 +236,46 @@ class LazySupervisedDataset(Dataset):
             'image': image,
             'problem': example['problem'],
             'solution': example['solution'],
-            'prompt': make_conversation_image(example)['prompt'] if 'image' in example else make_conversation(example)['prompt'],
+            'prompt': make_conversation_image(example)['prompt'],
         }
 
-'''
-    If the iou of the bbox predicted by the model and the ground truth is greater than 0.5, the reward is 1.0, otherwise 0.0 .
-    This is a hard reward, maybe the soft reward is better and could be used in the future .
-'''
-def iou_reward(completions, solution, **kwargs):
-    def iou(box1, box2):
-        inter_x1 = max(box1[0], box2[0])
-        inter_y1 = max(box1[1], box2[1])
-        inter_x2 = min(box1[2]-1, box2[2]-1)
-        inter_y2 = min(box1[3]-1, box2[3]-1)
-        if inter_x1 < inter_x2 and inter_y1 < inter_y2:
-            inter = (inter_x2-inter_x1+1)*(inter_y2-inter_y1+1)
-        else:
-            inter = 0
-        union = (box1[2]-box1[0])*(box1[3]-box1[1]) + (box2[2]-box2[0])*(box2[3]-box2[1]) - inter
-        return float(inter)/union
+
+def accuracy_reward(completions, solution, **kwargs):
+    """Reward function that checks if the completion is correct using symbolic verification, exact string matching, or fuzzy matching."""
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
     current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
-    answer_tag_pattern = r'<answer>(.*?)</answer>'
-    # bbox_pattern = r'\[(\s*-?\d*\.?\d+\s*),\s*(\s*-?\d*\.?\d+\s*),\s*(\s*-?\d*\.?\d+\s*),\s*(\s*-?\d*\.?\d+\s*)\]'
-    bbox_pattern = r'\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)]'
+
     for content, sol in zip(contents, solution):
         reward = 0.0
-        # Try symbolic verification first
+        # Try symbolic verification first for numeric answers
         try:
-            content_answer_match = re.search(answer_tag_pattern, content, re.DOTALL)
-            if content_answer_match:
-                content_answer = content_answer_match.group(1).strip()
-                bbox_match = re.search(bbox_pattern, content_answer)
-                if bbox_match:
-                    bbox = [int(bbox_match.group(1)), int(bbox_match.group(2)), int(bbox_match.group(3)), int(bbox_match.group(4))]
-                    if iou(bbox, sol) > 0.5:
-                        reward = 1.0
+            answer = parse(content)
+            if float(verify(answer, parse(sol))) > 0:
+                reward = 1.0
         except Exception:
             pass  # Continue to next verification method if this fails
-                
+
+        # If symbolic verification failed, try string matching or fuzzy matching
+        if reward == 0.0:
+            try:
+                # Extract answer from solution if it has think/answer tags
+                sol_match = re.search(r'<answer>(.*?)</answer>', sol.replace("\n", "").replace(" ", ""))
+                ground_truth = sol_match.group(1).strip() if sol_match else sol.strip()
+
+                # Extract answer from content if it has think/answer tags
+
+                content_match = re.search(r'<answer>(.*?)</answer>', content.replace("\n", "").replace(" ", ""), re.DOTALL)
+                student_answer = content_match.group(1).strip() if content_match else content.strip()
+
+                reward = sentence_similar(student_answer.lower(), ground_truth.lower())
+
+            except Exception:
+                pass  # Keep reward as 0.0 if all methods fail
+
         rewards.append(reward)
         if os.getenv("DEBUG_MODE") == "true":
             log_path = os.getenv("LOG_PATH")
-            # local_rank = int(os.getenv("LOCAL_RANK", 0))
             with open(log_path, "a", encoding='utf-8') as f:
                 f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
                 f.write(f"Content: {content}\n")
@@ -274,15 +285,22 @@ def iou_reward(completions, solution, **kwargs):
 
 def format_reward(completions, **kwargs):
     """Reward function that checks if the completion has a specific format."""
-    # pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
-    pattern = r"<think>.*?</think>\s*<answer>.*?\{.*\[\d+,\s*\d+,\s*\d+,\s*\d+\].*\}.*?</answer>"
+    pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
     completion_contents = [completion[0]["content"] for completion in completions]
-    matches = [re.fullmatch(pattern, content, re.DOTALL) for content in completion_contents]
+    matches = [re.fullmatch(pattern, content.replace("\n", "").replace(" ", ""), re.DOTALL) for content in completion_contents]
+    if os.getenv("DEBUG_MODE") == "true":
+        log_path = os.getenv("LOG_PATH")
+        current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
+        with open(log_path, "a", encoding='utf-8') as f:
+            f.write(f"------------- {current_time} Format reward -------------\n")
+            for content, match in zip(completion_contents, matches):
+                f.write(f"Content: {content}\n")
+                f.write(f"Has format: {bool(match)}\n")
     return [1.0 if match else 0.0 for match in matches]
 
 
 reward_funcs_registry = {
-    "accuracy": iou_reward,
+    "accuracy": accuracy_reward,
     "format": format_reward,
 }
 
