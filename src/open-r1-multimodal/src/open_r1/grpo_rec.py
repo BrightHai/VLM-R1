@@ -137,8 +137,7 @@ SYSTEM_PROMPT = (
     "<think> reasoning process here </think><answer> answer here </answer>"
 )
 
-QUESTION_TEMPLATE = "{Question}，先在<think> </think>标签中输出思考过程，然后在<answer> </answer>标签中输出最终答案"
-""
+QUESTION_TEMPLATE = "给你一个App截图，分析是否存在UI展示问题，先在<think> </think>标签中输出思考过程，然后在<answer> </answer>标签中输出最终答案"
 
 
 class LazySupervisedDataset(Dataset):
@@ -211,7 +210,7 @@ class LazySupervisedDataset(Dataset):
                         "role": "user",
                         "content": [
                             {"type": "image"},
-                            {"type": "text", "text": QUESTION_TEMPLATE.format(Question=example["problem"])},
+                            {"type": "text", "text": QUESTION_TEMPLATE},
                         ],
                     },
                 ],
@@ -248,15 +247,6 @@ def accuracy_reward(completions, solution, **kwargs):
 
     for content, sol in zip(contents, solution):
         reward = 0.0
-        # Try symbolic verification first for numeric answers
-        try:
-            answer = parse(content)
-            if float(verify(answer, parse(sol))) > 0:
-                reward = 1.0
-        except Exception:
-            pass  # Continue to next verification method if this fails
-
-        # If symbolic verification failed, try string matching or fuzzy matching
         if reward == 0.0:
             try:
                 # Extract answer from solution if it has think/answer tags
@@ -264,7 +254,7 @@ def accuracy_reward(completions, solution, **kwargs):
                 ground_truth = sol_match.group(1).strip() if sol_match else sol.strip()
 
                 # Extract answer from content if it has think/answer tags
-
+                content = content.replace(QUESTION_TEMPLATE, "").replace("assistant", "")
                 content_match = re.search(r'<answer>(.*?)</answer>', content.replace("\n", "").replace(" ", ""), re.DOTALL)
                 student_answer = content_match.group(1).strip() if content_match else content.strip()
 
@@ -286,16 +276,8 @@ def accuracy_reward(completions, solution, **kwargs):
 def format_reward(completions, **kwargs):
     """Reward function that checks if the completion has a specific format."""
     pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
-    completion_contents = [completion[0]["content"] for completion in completions]
+    completion_contents = [completion[0]["content"].replace(QUESTION_TEMPLATE, "").replace("assistant", "") for completion in completions]
     matches = [re.fullmatch(pattern, content.replace("\n", "").replace(" ", ""), re.DOTALL) for content in completion_contents]
-    if os.getenv("DEBUG_MODE") == "true":
-        log_path = os.getenv("LOG_PATH")
-        current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
-        with open(log_path, "a", encoding='utf-8') as f:
-            f.write(f"------------- {current_time} Format reward -------------\n")
-            for content, match in zip(completion_contents, matches):
-                f.write(f"Content: {content}\n")
-                f.write(f"Has format: {bool(match)}\n")
     return [1.0 if match else 0.0 for match in matches]
 
 
